@@ -1166,3 +1166,151 @@ def test_compare_editions_reuses_assemble_segment_limits():
 def test_compare_editions_index_lists_endpoint():
     info = client.get("/").json()
     assert info["compare_editions"] == "POST /api/compare-editions"
+
+
+def test_trace_reading_endpoint_single_segment_leg():
+    resp = client.post(
+        "/api/trace-reading",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "start": 2,
+            "end": 6,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert (data["start"], data["end"]) == (2, 6)
+    assert data["interval_text"] == "时习之不"
+    assert data["switch_count"] == 0
+    assert data["question_count"] == 0
+    assert data["ambiguous"] is False
+    assert data["switch_positions"] == []
+    assert data["question_positions"] == []
+    assert len(data["legs"]) == 1
+    leg = data["legs"][0]
+    assert leg["segment"] == 1
+    assert leg["merged"] == {
+        "start": 2,
+        "end": 6,
+        "fragment": "时习之不",
+        "sources": [[{"segment": 1, "pos": p}] for p in range(4)],
+    }
+    assert leg["original"]["start"] == 0 and leg["original"]["end"] == 4
+    assert leg["original"]["fragment"] == "时习之不"
+
+
+def test_trace_reading_endpoint_full_interval():
+    resp = client.post(
+        "/api/trace-reading",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "start": 0,
+            "end": 9,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["interval_text"] == "学而时习之不亦乐乎"
+    assert data["switch_count"] == 2
+    assert data["question_count"] == 1
+    assert data["ambiguous"] is True
+    assert [l["segment"] for l in data["legs"]] == [0, 1, 2]
+    assert data["switch_positions"] == [
+        {"pos": 4, "from_segment": 0, "to_segment": 1},
+        {"pos": 5, "from_segment": 1, "to_segment": 2},
+    ]
+    assert data["question_positions"] == [
+        {"pos": 2, "segment": 0, "original_pos": 2, "output_char": "时"}
+    ]
+    # 路径段拼接稿区间首尾相接，覆盖整个区间
+    bounds = [(l["merged"]["start"], l["merged"]["end"]) for l in data["legs"]]
+    assert bounds == [(0, 4), (4, 5), (5, 9)]
+
+
+def test_trace_reading_question_minimization():
+    # 段 1 已知字全程覆盖，无须选段 0 的 ?
+    resp = client.post(
+        "/api/trace-reading",
+        json={"segments": ["甲?丙", "甲乙丙"], "start": 0, "end": 3},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["switch_count"] == 0
+    assert data["question_count"] == 0
+    assert data["ambiguous"] is False
+    assert [l["segment"] for l in data["legs"]] == [1]
+
+
+def test_trace_reading_no_complete_path_returns_422():
+    # 拼接 甲乙丙Y丙：插入字 Y（仅段 1）与后续“丙”在段 1 原文不连续，
+    # 换后侧又无 0/1 共同覆盖见证，整条区间无完整证据路径
+    resp = client.post(
+        "/api/trace-reading",
+        json={"segments": ["甲乙丙", "甲乙XY丙"], "start": 0, "end": 5},
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+
+def test_trace_reading_invalid_interval_returns_422():
+    body = {"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    # 空区间
+    assert client.post("/api/trace-reading", json={**body, "start": 0, "end": 0}).status_code == 422
+    # start == end（中部）
+    assert client.post("/api/trace-reading", json={**body, "start": 3, "end": 3}).status_code == 422
+    # start > end
+    assert client.post("/api/trace-reading", json={**body, "start": 5, "end": 3}).status_code == 422
+    # end 越界
+    assert client.post("/api/trace-reading", json={**body, "start": 0, "end": 9}).status_code == 422
+
+
+def test_trace_reading_negative_or_missing_interval_returns_422():
+    body = {"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    assert client.post("/api/trace-reading", json={**body, "start": -1, "end": 3}).status_code == 422
+    assert client.post("/api/trace-reading", json={**body, "start": 0, "end": -1}).status_code == 422
+    # 缺字段
+    assert client.post("/api/trace-reading", json=body).status_code == 422
+    assert client.post("/api/trace-reading", json={"start": 0, "end": 3}).status_code == 422
+    # 布尔值不被接受为整数下标
+    assert client.post(
+        "/api/trace-reading", json={**body, "start": True, "end": 3}
+    ).status_code == 422
+
+
+def test_trace_reading_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/trace-reading",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "start": 0,
+            "end": 3,
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_trace_reading_reuses_assemble_segment_limits():
+    body = {"start": 0, "end": 1}
+    # 段数不足 / 超上限
+    assert client.post("/api/trace-reading", json={"segments": ["abc"], **body}).status_code == 422
+    assert client.post(
+        "/api/trace-reading",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"], **body},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/trace-reading", json={"segments": ["a" * 500, "b" * 501], **body}
+    ).status_code == 422
+    assert client.post(
+        "/api/trace-reading", json={"segments": ["字" * 400, "字" * 401], **body}
+    ).status_code == 422
+    assert client.post(
+        "/api/trace-reading", json={"segments": ["abc", ""], **body}
+    ).status_code == 422
+
+
+def test_trace_reading_index_lists_endpoint():
+    info = client.get("/").json()
+    assert info["trace_reading"] == "POST /api/trace-reading"
