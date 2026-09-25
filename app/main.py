@@ -33,6 +33,14 @@
   （相同字或任一侧 ``?`` 记 0、已知异字记 1，整稿最多 2）的方案；唯一
   方案返回插入位置、缺文、异字数与接缝两侧 sources，不同缺文位置并列返回
   409，无合格方案返回 422。结果仅供人工复核，不改写拼接稿。
+- ``POST /api/trace-reading``：提交与 ``/api/assemble`` 相同限制的有序
+  segments 及拼接稿左闭右开区间 ``start``、``end``，复用其拼接文本和逐字
+  sources，为区间逐字选证据（原字等于输出字或为 ``?`` 才可作证；同段连续
+  取字原文下标逐次加一；换段仅可发生在交界两侧各至少一字同时含换前、换后
+  段来源处），依次最小化换段次数、所选 ``?`` 数求完整证据路径，同分按段
+  序号、原文下标序列字典序取首并标记其他同分路径，返回区间文本、每段路径
+  的拼接稿及原文区间、换段位置与所选 ``?`` 位置；区间非法或无完整路径返回
+  422。
 - ``POST /api/compare-editions``：提交 left_segments、right_segments 两组
   各 2～5 段转写，分别沿用 ``/api/assemble`` 的段数、长度限制与续接门槛
   各自拼接；返回的版本文本沿用其逐字来源，但保留前段被同侧后段已知字
@@ -91,6 +99,7 @@ from .omission import (
 )
 from .repetition import find_repetition
 from .reviser import EditConflictError, EditLocationError, revise
+from .tracer import TraceReadingError, trace_reading
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
@@ -599,6 +608,102 @@ class CompareEditionsResponse(BaseModel):
     )
 
 
+class TraceReadingRequest(AssembleRequest):
+    """阅读证据路径请求：与 /api/assemble 相同的有序 segments，外加拼接稿区间。"""
+
+    start: int = Field(
+        ..., ge=0,
+        description="区间起点下标（含，从 0 开始，相对拼接文本）",
+        examples=[2],
+    )
+    end: int = Field(
+        ..., ge=0,
+        description="区间终点下标（不含，左闭右开，相对拼接文本）；允许 start == end",
+        examples=[5],
+    )
+
+
+class TraceInterval(BaseModel):
+    """一段连续取字（run）所覆盖的区间（下标从 0 开始，左闭右开）。"""
+
+    start: int = Field(..., description="区间起点下标（含，从 0 开始）")
+    end: int = Field(..., description="区间终点下标（不含，左闭右开）")
+    fragment: str = Field(..., description="区间原文片段")
+
+
+class TraceRun(BaseModel):
+    """证据路径中取自同一原始段的一段连续取字。"""
+
+    segment: int = Field(..., description="该段路径取自的原始段序号（从 0 开始）")
+    merged: TraceInterval = Field(
+        ...,
+        description="该段路径在拼接稿上覆盖的左闭右开区间及原文片段",
+    )
+    original: TraceInterval = Field(
+        ...,
+        description="该段路径在原始段中的连续原文左闭右开区间及原文片段"
+                    "（段内连续取字，下标逐次加一）",
+    )
+
+
+class TraceSwitch(BaseModel):
+    """证据路径上的一次换段：交界位于输出位置 pos-1 与 pos 之间。"""
+
+    pos: int = Field(
+        ...,
+        description="换段交界位置（拼接文本下标，从 0 开始）：交界位于 text[pos-1] 与 text[pos] 之间",
+    )
+    from_segment: int = Field(..., description="换前段序号（从 0 开始）")
+    from_pos: int = Field(..., description="交界左字所选换前段原文下标（从 0 开始）")
+    to_segment: int = Field(..., description="换后段序号（从 0 开始）")
+    to_pos: int = Field(..., description="交界右字所选换后段原文下标（从 0 开始）")
+
+
+class WildcardPick(BaseModel):
+    """证据路径上一个所选原字为 ``?`` 的位置。"""
+
+    pos: int = Field(..., description="在拼接文本中的位置（下标从 0 开始）")
+    segment: int = Field(..., description="所选来源的原始段序号（从 0 开始）")
+    source_pos: int = Field(..., description="所选 ? 在该原始段中的原文下标（从 0 开始）")
+
+
+class TraceReadingResponse(BaseModel):
+    """阅读证据路径结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="整份拼接文本的逐字来源列表，规则与 /api/assemble 一致",
+    )
+    start: int = Field(..., description="区间起点下标（含，从 0 开始，原样回显）")
+    end: int = Field(..., description="区间终点下标（不含，左闭右开，原样回显）")
+    fragment: str = Field(..., description="区间文本，即 text[start:end]")
+    switch_count: int = Field(..., description="最优证据路径的换段次数")
+    wildcard_count: int = Field(..., description="最优证据路径上所选原字为 ? 的字数")
+    evidence: list[CharSource] = Field(
+        ...,
+        description="区间逐字所选证据，与 fragment 等长；每项为该字所选来源"
+                    "（段序号 segment、原文下标 pos），同段连续项的 pos 逐次加一",
+    )
+    runs: list[TraceRun] = Field(
+        ...,
+        description="按阅读顺序排列的每段路径：连续取自同一原始段的选择合并为一项，"
+                    "给出其拼接稿区间 merged 与原文区间 original",
+    )
+    switches: list[TraceSwitch] = Field(
+        ...,
+        description="换段位置列表，按位置升序；交界两侧相邻字各自同时含换前、换后段来源",
+    )
+    wildcard_picks: list[WildcardPick] = Field(
+        ...,
+        description="所选 ? 位置列表，按拼接文本位置升序",
+    )
+    ambiguous: bool = Field(
+        ...,
+        description="取得该最小（换段次数、? 数）的完整证据路径是否还存在其他同分路径",
+    )
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -613,6 +718,7 @@ def index():
         "find_repetition": "POST /api/find-repetition",
         "audit_omission": "POST /api/audit-omission",
         "compare_editions": "POST /api/compare-editions",
+        "trace_reading": "POST /api/trace-reading",
         "docs": "/docs",
         "health": "/health",
     }
@@ -1231,4 +1337,61 @@ def api_compare_editions(req: CompareEditionsRequest):
                 "side": exc.side,
                 "failed_segment": exc.failed_segment,
             },
+        ) from exc
+
+
+@app.post(
+    "/api/trace-reading",
+    response_model=TraceReadingResponse,
+    status_code=200,
+    summary="为拼接稿区间求逐字阅读证据路径",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "另附拼接稿上的左闭右开区间 `start`、`end`（下标从 0 开始，允许 "
+        "`start == end`）。接口先复用其拼接得到文本与逐字来源，再为区间内"
+        "**每个输出字**从逐字来源中选取一个原始段原字作证：仅当**原字等于输出"
+        "字**、或**原字为 `?`** 时该来源才有资格（异字冲突一方不可作证）；"
+        "**同段连续取字**时原文下标必须**逐次加一**（不跳字、不倒读）；"
+        "**换段**仅可发生在交界两侧相邻字 `text[pos-1]`、`text[pos]` **各自"
+        "同时含有换前段与换后段来源**处（两侧重叠区各至少一字）。为整个区间"
+        "求覆盖每个字的完整证据路径，依次**最小化换段次数**、**最小化所选 "
+        "`?` 数**；同分按各字所选 (段序号, 原文下标) 序列**字典序取首**，并以 "
+        "`ambiguous` 标记是否还存在其他同分路径。返回区间文本 `fragment`、"
+        "逐字 `evidence`、每段路径的拼接稿区间 `merged` 与原文区间 `original`"
+        "（`runs`）、换段位置 `switches`、所选 `?` 位置 `wildcard_picks` 及 "
+        "`switch_count` / `wildcard_count`。区间非法（越界、`start > end`）或"
+        "不存在覆盖全部字的完整路径时返回 **422**。接口只做证据回溯，**不改写"
+        "拼接文本**。"
+    ),
+    responses={
+        422: {
+            "description": "续接失败、区间非法，或不存在覆盖整个区间的完整证据路径",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "区间 [2, 6)（4 字）不存在覆盖全部输出字的完整证据路径：某字无“原字等于输出字或为 ?”的来源，或同段连续取字、换段重叠要求无法同时满足"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_trace_reading(req: TraceReadingRequest):
+    try:
+        return trace_reading(req.segments, req.start, req.end)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except TraceReadingError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
         ) from exc

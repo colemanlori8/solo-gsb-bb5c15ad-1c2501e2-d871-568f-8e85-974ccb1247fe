@@ -41,17 +41,31 @@
 **对角 → 删除左字 → 插入右字**固定择优，`ambiguous` 标记是否存在多条最优路径；把**连续非零代价列**
 合并为差异块，返回两侧左闭右开区间、原文与逐字 `sources`、`total_cost` 及 `ambiguous`；两份稿子
 完全一致（或仅差 `?`）时差异块为空。
+- **`POST /api/trace-reading`**：提交与 `/api/assemble` 相同限制的有序 `segments` 及拼接稿左闭右开区间
+`start`、`end`，复用其拼接文本与逐字来源，为区间逐字选**阅读证据**——仅当**原字等于输出字或为 `?`**
+时该来源才可作证（异字冲突一方不可作证），**同段连续取字原文下标逐次加一**，**换段仅可发生在交界
+两侧至少一字同时含换前、换后段来源处**；为整个区间依次**最小化换段次数、所选 `?` 数**求完整证据
+路径，同分按段序号、原文下标序列**字典序取首**并以 `ambiguous` 标记其他同分路径，返回区间文本、
+**每段路径的拼接稿及原文区间**、换段位置与所选 `?` 位置；区间非法或无完整路径返回 **422**。
 
 ## 快速开始
 
-单条命令启动（依赖已纳入镜像构建）：
+**必要配置**：本机已安装 Docker 与 Docker Compose（`docker compose` 子命令可用即可，无需另装数据库或
+其他外部服务）；`docker-compose.yml` 将容器 **8000 端口映射到宿主机 8000 端口**，如宿主机 8000 端口
+被占用，可把 `docker-compose.yml` 中 `"8000:8000"` 的左侧端口改为其他空闲端口（容器内始终监听
+8000）。应用依赖（FastAPI、Uvicorn）已写入 `requirements.txt` 并在 `Dockerfile` 构建镜像时安装，
+**无需在宿主机单独安装 Python 依赖**，也不需要任何环境变量或密钥。
+
+单条命令构建镜像并启动（依赖已纳入镜像构建）：
 
 ```bash
 docker compose up --build
 ```
 
-- **接口地址**：http://localhost:8000
-- **端口**：8000
+启动后：
+
+- **接口地址（基址）**：http://localhost:8000
+- **端口**：8000（HTTP）
 - **交互式接口文档（Swagger UI）**：http://localhost:8000/docs
 - **健康检查**：http://localhost:8000/health
 
@@ -1185,6 +1199,178 @@ curl -X POST http://localhost:8000/api/compare-editions \
 返回 **422**；某一侧拼接未通过续接门槛时同样返回 **422**，`detail` 中给出 `side`（`left` / `right`）
 与 `failed_segment`（从 0 开始）。
 
+### `POST /api/trace-reading`
+
+供校勘人员回溯拼接稿某段文字的**阅读证据**：区间里每个输出字究竟能对应到哪一原始段的哪个原字，
+跨段处是否落在真实的续接重叠上。请求的 `segments` 与 `/api/assemble` 完全相同（沿用 2～5 段、单段
+最长 500 字、总长最长 800 字的限制与续接门槛，续接失败同样返回 **422** 并给出 `failed_segment`），
+另附拼接稿上的左闭右开区间 `start`、`end`（下标从 0 开始，允许 `start == end` 的空区间）。接口先
+复用 `/api/assemble` 得到拼接文本与逐字来源，再为区间内**每个输出字**从其逐字来源中选取一个原始
+段原字作为证据：
+
+- **证据资格**：仅当来源处的**原字等于该输出字**、或**原字为 `?`**（未辨认字）时才可作证；异字
+  冲突中字形不同的那一方**不可作证**；
+- **同段连续取字**：相邻两字取自同一原始段时，原文下标必须**逐次加一**（不允许跳字、倒读）；
+- **换段约束**：相邻两字取自不同原始段（换段）仅可发生在交界两侧的输出字 `text[pos-1]`、
+  `text[pos]` **各自同时含有换前段与换后段来源**处——即交界前后各至少一字落在两段的续接重叠中，
+  换段才被接受；
+- **择优**：为整个区间求一条覆盖每个字的完整证据路径，依次**最小化换段次数**、**最小化所选 `?`
+  数**；代价相同时按各字所选 **(段序号, 原文下标) 序列字典序取首**（段序号序列优先，再比原文下标
+  序列），结果确定、可复现；
+- **歧义标记**：`ambiguous` 表示取得该最小（换段次数、`?` 数）的完整证据路径是否还存在**其他同分
+  路径**（不影响返回的那条字典序最小路径，仅提示阅读出处存在别的等价解释）；
+- **无解**：区间非法（越界、`start > end`），或区间中某字没有任何合格来源、连续性/换段约束无法
+  同时满足、不存在覆盖全部字的完整路径时，返回 **422**。接口**只做证据回溯，不改写拼接文本**。
+
+请求体：
+
+```json
+{
+  "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+  "start": 0,
+  "end": 9
+}
+```
+
+- `segments`：必填，2～5 个非空字符串；单段最长 500 字，各段总长最长 800 字（同 `/api/assemble`）。
+- `start` / `end`：必填，非负整数，拼接稿下标（从 0 开始），**左闭右开** `[start, end)`，允许相等。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/trace-reading \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["学而?习之", "时习之不", "之不亦乐乎"], "start": 0, "end": 9}'
+```
+
+响应示例（拼接文本 `学而时习之不亦乐乎`；最早合法的段 0→段 1 换段落在“习”字前——“时”“习”都同时
+含段 0、1 来源，而“而”不含段 1，故“时”不能改由段 1 提供，只能取段 0 的 `?`；“习”取段 0(p3)
+或在此换段取段 1(p1) 代价相同，故 `ambiguous` 为 **true**）：
+
+```json
+{
+  "text": "学而时习之不亦乐乎",
+  "sources": [ "…" ],
+  "start": 0,
+  "end": 9,
+  "fragment": "学而时习之不亦乐乎",
+  "switch_count": 2,
+  "wildcard_count": 1,
+  "evidence": [
+    { "segment": 0, "pos": 0 },
+    { "segment": 0, "pos": 1 },
+    { "segment": 0, "pos": 2 },
+    { "segment": 0, "pos": 3 },
+    { "segment": 1, "pos": 2 },
+    { "segment": 2, "pos": 1 },
+    { "segment": 2, "pos": 2 },
+    { "segment": 2, "pos": 3 },
+    { "segment": 2, "pos": 4 }
+  ],
+  "runs": [
+    {
+      "segment": 0,
+      "merged": { "start": 0, "end": 4, "fragment": "学而时习" },
+      "original": { "start": 0, "end": 4, "fragment": "学而?习" }
+    },
+    {
+      "segment": 1,
+      "merged": { "start": 4, "end": 5, "fragment": "之" },
+      "original": { "start": 2, "end": 3, "fragment": "之" }
+    },
+    {
+      "segment": 2,
+      "merged": { "start": 5, "end": 9, "fragment": "不亦乐乎" },
+      "original": { "start": 1, "end": 5, "fragment": "不亦乐乎" }
+    }
+  ],
+  "switches": [
+    { "pos": 4, "from_segment": 0, "from_pos": 3, "to_segment": 1, "to_pos": 2 },
+    { "pos": 5, "from_segment": 1, "from_pos": 2, "to_segment": 2, "to_pos": 1 }
+  ],
+  "wildcard_picks": [
+    { "pos": 2, "segment": 0, "source_pos": 2 }
+  ],
+  "ambiguous": true
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` / `sources` | 整份拼接文本及其逐字来源（与 `/api/assemble` 一致，不被改写） |
+| `start` / `end` | 原样回显的区间下标（从 0 开始，**左闭右开**） |
+| `fragment` | 区间文本，即 `text[start:end]` |
+| `switch_count` | 最优证据路径的换段次数 |
+| `wildcard_count` | 最优证据路径上所选原字为 `?` 的字数 |
+| `evidence[]` | 区间逐字所选证据，与 `fragment` 等长；每项 `{segment, pos}` 为该字所选来源，同段连续项的 `pos` 逐次加一 |
+| `runs[].segment` | 该段路径取自的原始段序号（从 0 开始） |
+| `runs[].merged` | 该段路径在**拼接稿**上覆盖的左闭右开区间 `[start, end)` 及片段 |
+| `runs[].original` | 该段路径在**原始段**中的连续原文左闭右开区间及片段 |
+| `switches[]` | 换段位置：`pos` 为交界右字位置（交界位于 `text[pos-1]` 与 `text[pos]` 之间），并给出交界两侧所选的 `(from_segment, from_pos)` 与 `(to_segment, to_pos)`，按 `pos` 升序 |
+| `wildcard_picks[]` | 所选 `?` 位置：每项 `{pos, segment, source_pos}`，按拼接文本位置升序 |
+| `ambiguous` | 是否还存在其他取得同一最小（换段次数、`?` 数）的完整证据路径 |
+
+上例中：证据路径先在段 0 连续读 `学而?习`（下标 0～3，“时”位所选原字为段 0 的 `?`），在“习”与“之”
+之间由段 0 换入段 1 读“之”（段 1 下标 2），再在“之”与“不”之间由段 1 换入段 2 连续读 `不亦乐乎`
+（段 2 下标 1～4）；两次换段处交界两侧相邻字都同时含有换前、换后段的来源。
+
+子区间完全落在某一段的连续原文内时无需换段、无需 `?`，例如对同一拼接稿求区间 `[3, 6)`（`习之不`）：
+
+```bash
+curl -X POST http://localhost:8000/api/trace-reading \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["学而?习之", "时习之不", "之不亦乐乎"], "start": 3, "end": 6}'
+```
+
+```json
+{
+  "text": "学而时习之不亦乐乎",
+  "sources": [ "…" ],
+  "start": 3,
+  "end": 6,
+  "fragment": "习之不",
+  "switch_count": 0,
+  "wildcard_count": 0,
+  "evidence": [
+    { "segment": 1, "pos": 1 },
+    { "segment": 1, "pos": 2 },
+    { "segment": 1, "pos": 3 }
+  ],
+  "runs": [
+    {
+      "segment": 1,
+      "merged": { "start": 3, "end": 6, "fragment": "习之不" },
+      "original": { "start": 1, "end": 4, "fragment": "习之不" }
+    }
+  ],
+  "switches": [],
+  "wildcard_picks": [],
+  "ambiguous": false
+}
+```
+
+**无完整路径（422）**示例——某字仅能由前段作证、其后某字仅能由后段作证，而唯一的换段交界有一侧
+不含换前段来源（两段在该处并非双向重叠），同段连续又无法跨越对齐空缺：
+
+```bash
+curl -X POST http://localhost:8000/api/trace-reading \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊己", "乙丙戊庚辛"], "start": 3, "end": 7}'
+```
+
+```json
+{
+  "detail": {
+    "message": "区间 [3, 7)（4 字）不存在覆盖全部输出字的完整证据路径：某字无“原字等于输出字或为 ?”的来源，或同段连续取字、换段重叠要求无法同时满足"
+  }
+}
+```
+
+区间越界、`start > end`、`start`/`end` 为负或缺字段，或 segments 不满足 `/api/assemble` 的段数/长度
+限制、续接失败，同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -1232,6 +1418,13 @@ curl -X POST http://localhost:8000/api/compare-editions \
   删除左字、插入右字各 1；同分路径按对角 → 删除左字 → 插入右字固定择优，另以 `ambiguous` 标记最优
   路径是否多条；连续非零代价列合并为差异块，给出两侧左闭右开区间、原文与逐字 sources，完全一致
   （或仅差 `?`）时差异块为空；只对勘，不改写任何一份拼接稿。
+- `/api/trace-reading` 复用 `/api/assemble` 的拼接文本与逐字来源（沿用段数/长度限制与续接失败规则），
+  为拼接稿 `[start, end)` 区间逐字选证据：来源原字等于输出字或为 `?` 才可作证（异字冲突一方排除），
+  同段连续取字原文下标逐次加一，换段仅可发生在交界两侧相邻字各自同时含换前、换后段来源处。依次
+  **最小化换段次数、所选 `?` 数**求覆盖整段区间的完整路径，同分按各字 (段序号, 原文下标) 序列字典序
+  取首，并以 `ambiguous` 标记其他同分路径；返回区间文本、逐字 evidence、每段路径的拼接稿区间 merged
+  与原文区间 original、换段位置 switches 与所选 `?` 位置 wildcard_picks；区间非法或无完整路径返回
+  **422**；只回溯证据，不改写拼接稿。
 
 ## 本地开发（不使用 Docker）
 
@@ -1260,7 +1453,8 @@ app/
   repetition.py # 重复抄写发现：对角扫描兼容 run + 滑动窗口取最长/已知相同位最多的非重叠等长区间对
   omission.py   # 脱漏审计：段间接缝枚举 + 参照稿连续缺文补入后逐位异字数（前/后缀和）择优与并列判定
   comparator.py # 双版本对勘：两份拼接稿的全局逐字最小编辑 DP（对角/删除/插入择优 + 路径歧义标记）+ 非零列合并差异块
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission、/api/compare-editions）
+  tracer.py     # 阅读证据路径：逐字证据资格（原字等于输出字或为 ?）+ 同段下标连续/换段双向重叠约束的分层 DP，最小化换段数、? 数并字典序取首、标记同分路径
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission、/api/compare-editions、/api/trace-reading）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml
